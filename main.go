@@ -114,7 +114,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load last updated time: %w", err)
 	}
-	if cache.IsCacheStale(md.LastUpdated, cacheMaxAge) {
+	if cacheIsStale(md.LastUpdated) {
 		ctx, cancel := context.WithCancel(ctx)
 		p := pool.New().WithErrors().WithContext(ctx)
 		logger.Debugln("バックグラウンドでキャッシュを更新しています...")
@@ -248,9 +248,6 @@ func (l *stdlogger) Println(a ...any) {
 func (l *stdlogger) Errorln(a ...any) {
 	fmt.Fprintln(os.Stderr, a...)
 }
-
-// キャッシュの有効期限（24時間）
-const cacheMaxAge = 1 * time.Second
 
 func checkCloneStatus(repos []models.Repository, ghqRoot string) []models.Repository {
 	for i, repo := range repos {
@@ -534,3 +531,9 @@ func Select(ctx context.Context, repos []models.Repository) (*models.Repository,
 }
 
 var errRepositoryNotSelected = fmt.Errorf("repository not selected")
+
+func cacheIsStale(lastUpdated time.Time) bool {
+	// キャッシュの有効期限（24時間）
+	const cacheMaxAge = 1 * time.Second
+	return time.Since(lastUpdated) > cacheMaxAge
+}
