@@ -144,6 +144,21 @@ func run(ctx context.Context) error {
 		fmt.Fprintln(os.Stderr, "Cache saved successfully")
 		return nil
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p := pool.New().WithErrors().WithContext(ctx)
+	p.Go(func(ctx context.Context) error {
+		return updateCache(ctx)
+	})
+	defer func() {
+		cancel()
+		if err := p.Wait(); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			fmt.Fprintln(os.Stderr, err)
+		}
+	}()
 
 	allRepos := make([]models.Repository, 0)
 
@@ -170,6 +185,9 @@ func run(ctx context.Context) error {
 
 	selected, err := cmd.Select(ctx, allRepos)
 	if err != nil {
+		if errors.Is(err, cmd.ErrRepositoryNotSelected) {
+			return nil
+		}
 		return fmt.Errorf("error selecting repository: %w", err)
 	}
 
