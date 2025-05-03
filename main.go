@@ -15,6 +15,7 @@ import (
 	"github.com/n3xem/gh-otui/cmd"
 	"github.com/n3xem/gh-otui/github"
 	"github.com/n3xem/gh-otui/models"
+	"github.com/sourcegraph/conc/pool"
 
 	"github.com/briandowns/spinner"
 )
@@ -44,6 +45,77 @@ func deduplicateRepositories(repos []models.Repository) []models.Repository {
 	return result
 }
 
+func updateCache(ctx context.Context) error {
+	hosts := auth.KnownHosts()
+	gihubClients := make([]*github.Client, 0, len(hosts))
+	for _, host := range hosts {
+		client, err := github.NewClient(api.ClientOptions{
+			Host: host,
+		})
+		if err != nil {
+			return err
+		}
+		gihubClients = append(gihubClients, client)
+	}
+	p := pool.New().WithErrors().WithContext(ctx)
+	for _, client := range gihubClients {
+		p.Go(func(ctx context.Context) error {
+			g, err := github.FetchUserRepositories(ctx, client)
+			if err != nil {
+				return err
+			}
+			if err := cache.Save(ctx, g); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+	for _, client := range gihubClients {
+		p.Go(func(ctx context.Context) error {
+			orgs, err := github.NewOrganizations(ctx, client)
+			if err != nil {
+				return err
+			}
+			pp := pool.New().WithErrors().WithContext(ctx)
+			for _, org := range orgs {
+				pp.Go(func(ctx context.Context) error {
+					g, err := org.FetchRepositories(ctx)
+					if err != nil {
+						return err
+					}
+					if err := cache.Save(ctx, g); err != nil {
+						return err
+					}
+					return nil
+				})
+			}
+			if err := pp.Wait(); err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+	for _, client := range gihubClients {
+		p.Go(func(ctx context.Context) error {
+			gs, err := github.FetchCollaboratingRepositories(ctx, client)
+			if err != nil {
+				return err
+			}
+			for g := range gs {
+				if err := cache.Save(ctx, g); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := p.Wait(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func run(ctx context.Context) error {
 	if err := cmd.CheckRequiredCommands(); err != nil {
 		return err
@@ -56,68 +128,19 @@ func run(ctx context.Context) error {
 
 	// Handle cache creation
 	if len(os.Args) > 1 && os.Args[1] == "--cache" {
-		s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-		s.Suffix = " Fetching repositories..."
-		s.Start()
-		hosts := auth.KnownHosts()
-		gihubClients := make([]*github.Client, 0, len(hosts))
-		for _, host := range hosts {
-			client, err := github.NewClient(api.ClientOptions{
-				Host: host,
-			})
-			if err != nil {
+		err := func() error {
+			s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+			s.Suffix = " Fetching repositories..."
+			s.Start()
+			defer s.Stop()
+			if err := updateCache(ctx); err != nil {
 				return err
 			}
-			gihubClients = append(gihubClients, client)
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
-		bufErrors := make([]error, 0, 8)
-		for _, client := range gihubClients {
-			g, err := github.FetchUserRepositories(ctx, client)
-			if err != nil {
-				bufErrors = append(bufErrors, err)
-				continue
-			}
-			if err := cache.Save(ctx, g); err != nil {
-				bufErrors = append(bufErrors, err)
-				continue
-			}
-		}
-		for _, client := range gihubClients {
-			orgs, err := github.NewOrganizations(ctx, client)
-			if err != nil {
-				return err
-			}
-			for _, org := range orgs {
-				g, err := org.FetchRepositories(ctx)
-				if err != nil {
-					bufErrors = append(bufErrors, err)
-					continue
-				}
-				if err := cache.Save(ctx, g); err != nil {
-					bufErrors = append(bufErrors, err)
-					continue
-				}
-			}
-		}
-		for _, client := range gihubClients {
-			gs, err := github.FetchCollaboratingRepositories(ctx, client)
-			if err != nil {
-				bufErrors = append(bufErrors, err)
-				continue
-			}
-			for g := range gs {
-				if err := cache.Save(ctx, g); err != nil {
-					bufErrors = append(bufErrors, err)
-					continue
-				}
-			}
-		}
-		s.Stop()
-
-		if len(bufErrors) > 0 {
-			return errors.Join(bufErrors...)
-		}
-
 		fmt.Fprintln(os.Stderr, "Cache saved successfully")
 		return nil
 	}
